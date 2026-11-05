@@ -1,0 +1,26 @@
+# Local tools and Python caches
+.idea/
+.cursor/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+.env.*
+
+# Local experiments and development notes
+/cases/
+/函数文档.md
+/初始化状态.md
+/初始化评估计划.md
+/改写任务（修订稿）.md
+/测试文档.md
+/重启变量说明.md
+/CICE-JAX验证变量对照.md
+/开发文档.md
+
+# Generated logs
+*.log
+cice.runlog*
+cice.bldlog*
+slurm*.out

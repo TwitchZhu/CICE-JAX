@@ -1,0 +1,11 @@
+name: cice_jax
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - netcdf4
+  - pip:
+      # Linux NVIDIA GPU; pip installs the CUDA 12 and cuDNN runtime wheels.
+      - jax[cuda12]==0.6.2
