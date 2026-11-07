@@ -381,7 +381,7 @@ def construct_fields(mm, tm, hm, tracer_type, depend, has_dependents,
         indices = tuple(group)
         carry = jax.lax.fori_loop(
             indices[0], indices[-1] + 1,
-            partial(reconstruct, kind=kind, has_children=has_children), carry)
+            partial(reconstruct, kind=kind, has_children=has_children), carry, unroll=4)
     tc, tx, ty, _, _ = carry
     return mc, mx, my, tc, tx, ty
 
@@ -712,7 +712,7 @@ def transport_integrals(mc, mx, my, tc, tx, ty, geometry,
     for kind, group in groupby(range(len(tracer_type)), key=tracer_type.__getitem__):
         indices = tuple(group)
         carry = jax.lax.fori_loop(
-            indices[0], indices[-1] + 1, partial(integrate, kind=kind), carry)
+            indices[0], indices[-1] + 1, partial(integrate, kind=kind), carry, unroll=4)
     _, _, _, tracer_fluxes = carry
     return mflx, tracer_fluxes
 
@@ -764,5 +764,5 @@ def update_fields(mm, tm, east_mass, north_mass, east_tracer, north_tracer,
     for kind, group in groupby(range(len(tracer_type)), key=tracer_type.__getitem__):
         indices = tuple(group)
         new_tracers = jax.lax.fori_loop(
-            indices[0], indices[-1] + 1, partial(recover, kind=kind), new_tracers)
+            indices[0], indices[-1] + 1, partial(recover, kind=kind), new_tracers, unroll=4)
     return new_mass, new_tracers, failed

@@ -14,30 +14,39 @@ from cicecore.drivers.standalone.cice.CICE_InitMod import CICE_Initialize
 from cicecore.drivers.standalone.cice.CICE_FinalMod import CICE_Finalize
 from cicecore.drivers.standalone.cice.CICE_JAXState import pack_initial_state
 from cicecore.drivers.standalone.cice.CICE_RunMod import CICE_Run
+from cicecore.cicedyn.infrastructure.comm.serial import ice_timers
+from cicecore.cicedyn.general import ice_forcing
+import jax
 
 
 def icemodel(wave_seed=None, diagnose=False, profile_dir=None, profile_steps=(5, 7),
              detailed_physics_steps=None):
-    #-----------------------------------------------------------------
-    # Initialize CICE
-    #-----------------------------------------------------------------
-
-    CICE_Initialize()
-
-    #-----------------------------------------------------------------
-    # Run CICE
-    #-----------------------------------------------------------------
-
-    pytree, static = pack_initial_state(wave_seed=wave_seed)
-    pytree = CICE_Run(pytree, static, diagnose=diagnose,
-                      profile_dir=profile_dir, profile_steps=profile_steps,
-                      detailed_physics_steps=detailed_physics_steps)
-
-    #-----------------------------------------------------------------
-    # Finalize CICE
-    #-----------------------------------------------------------------
-
-    CICE_Finalize()
+    timing = ice_timers.RunTiming()
+    completed = False
+    try:
+        with ice_timers.timing_phase("initialization"):
+            CICE_Initialize()
+            pytree, static = pack_initial_state(wave_seed=wave_seed)
+            jax.block_until_ready(pytree)
+            jax.effects_barrier()
+        with ice_timers.timing_phase("run"):
+            pytree = CICE_Run(pytree, static, diagnose=diagnose,
+                             profile_dir=profile_dir, profile_steps=profile_steps,
+                             detailed_physics_steps=detailed_physics_steps)
+            jax.block_until_ready(pytree)
+            jax.effects_barrier()
+        with ice_timers.timing_phase("finalize"):
+            CICE_Finalize()
+        completed = True
+    finally:
+        try:
+            with ice_timers.timing_phase("finalize"):
+                ice_forcing.close_forcing()
+        except BaseException:
+            completed = False
+            raise
+        finally:
+            timing.finish(completed)
 
 
 if __name__ == "__main__":

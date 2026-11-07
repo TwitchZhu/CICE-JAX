@@ -155,6 +155,8 @@ snow_file = ""
 # remember prior JRA55 values to reduce reading
 # first dim is yr, recnum; second dim is data1, data2
 frec_info = np.full((2, 2), -99, dtype=np.int32)
+_jra_dataset = None
+_jra_dataset_path = None
 
 jday_atm = None  # jday time vector from atm forcing files
 Njday_atm = 0  # Number of atm forcing timesteps
@@ -184,6 +186,7 @@ def alloc_forcing():
     if local_debug:
         ice_fileunits.nu_diag.write(f" {subname} fdbg start\n")
 
+    close_forcing()
     horiz = ice_domain_size.horizontal_shape()
     ncat = int(ice_domain_size.ncat)
     nfreq = int(ice_init.nfreq)
@@ -1991,6 +1994,16 @@ def JRA55_files(yr):
     nu.flush()
 
 
+def close_forcing():
+    """Release the single retained JRA55 input file at reset or model exit."""
+    global _jra_dataset, _jra_dataset_path
+    dataset = _jra_dataset
+    _jra_dataset = None
+    _jra_dataset_path = None
+    if dataset is not None:
+        dataset.close()
+
+
 def _jra_copy_slot():
     Tair_data[:, :, 0] = Tair_data[:, :, 1]
     uatm_data[:, :, 0] = uatm_data[:, :, 1]
@@ -2026,6 +2039,7 @@ def _jra_read_slot(dataset, recnum, slot):
 
 def JRA55_data(defer_ice_correction=False):
     global uwind_file, c1intp, c2intp, frec_info
+    global _jra_dataset, _jra_dataset_path
     subname = "(JRA55_data)"
     if local_debug:
         ice_fileunits.nu_diag.write(f" {subname} fdbg start\n")
@@ -2058,8 +2072,6 @@ def JRA55_data(defer_ice_correction=False):
     # ttlpcp   (precipitation kg/m s-1), 3 hr average
     #-------------------------------------------------------------------
 
-    dataset = None
-    dataset_path = None
     try:
         for n1 in (1, 2):
             lfyear = fyear
@@ -2107,18 +2119,18 @@ def JRA55_data(defer_ice_correction=False):
                 ):
                     _jra_copy_slot()
                 else:
-                    if dataset_path != uwind_file:
-                        if dataset is not None:
-                            dataset.close()
-                            dataset = None
-                        dataset = _nc_open(uwind_file)
-                        dataset_path = uwind_file
-                    _jra_read_slot(dataset, recnum, n1 - 1)
+                    # Reuse the annual file across steps; retain at most one handle.
+                    if _jra_dataset_path != uwind_file:
+                        close_forcing()
+                        _jra_dataset = _nc_open(uwind_file)
+                        _jra_dataset_path = uwind_file
+                    _jra_read_slot(_jra_dataset, recnum, n1 - 1)
             frec_info[0, n1 - 1] = lfyear
             frec_info[1, n1 - 1] = recnum
+    except BaseException:
+        close_forcing()
+        raise
     finally:
-        if dataset is not None:
-            dataset.close()
         # Restore the current forcing year even if a record read fails.
         uwind_file = file_year(uwind_file, fyear)
 

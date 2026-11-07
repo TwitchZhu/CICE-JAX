@@ -1,0 +1,5 @@
+npt_unit       = 'd'
+npt            = 5
+dumpfreq       = 'd'
+dumpfreq_n     = 5
+

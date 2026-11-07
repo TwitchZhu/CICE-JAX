@@ -15,18 +15,6 @@ import jax.numpy as jnp
 def solution_dEdd_jax(coszen, srftyp, tau, w0, g, albodr, albodf, nslyr):
     """Reflectance and transmittance of a vertical optical column."""
     klev = tau.shape[0] - 1
-    klevp = klev + 1
-    trndir = jnp.zeros(klevp + 1, dtype=tau.dtype).at[0].set(1.0)
-    trntdr = jnp.zeros(klevp + 1, dtype=tau.dtype).at[0].set(1.0)
-    trndif = jnp.zeros(klevp + 1, dtype=tau.dtype).at[0].set(1.0)
-    rdndif = jnp.zeros(klevp + 1, dtype=tau.dtype)
-    rdir = jnp.zeros(klev + 1, dtype=tau.dtype)
-    rdif_a = jnp.zeros(klev + 1, dtype=tau.dtype)
-    rdif_b = jnp.zeros(klev + 1, dtype=tau.dtype)
-    tdir = jnp.zeros(klev + 1, dtype=tau.dtype)
-    tdif_a = jnp.zeros(klev + 1, dtype=tau.dtype)
-    tdif_b = jnp.zeros(klev + 1, dtype=tau.dtype)
-    trnlay = jnp.zeros(klev + 1, dtype=tau.dtype)
     gauspt = jnp.asarray((0.9894009, 0.9445750, 0.8656312, 0.7554044,
                           0.6178762, 0.4580168, 0.2816036, 0.0950125),
                          dtype=tau.dtype)
@@ -38,118 +26,117 @@ def solution_dEdd_jax(coszen, srftyp, tau, w0, g, albodr, albodf, nslyr):
     mu0nij = jnp.sqrt(1.0 - (1.0 - mu0 ** 2) / refindx ** 2)
     kfrsnl = nslyr + 2 if srftyp < 2 else 0
 
-    def descend(k, carry):
-        (trndir, trntdr, trndif, rdndif, rdir, rdif_a, rdif_b,
-         tdir, tdif_a, tdif_b, trnlay) = carry
+    # Evaluate optical properties only while radiation penetrates the column.
+    def layer_optics(k):
+        wtot = w0[k]
+        gtot = g[k]
+        ftot = gtot ** 2
+        ts = (1.0 - wtot * ftot) * tau[k]
+        ws = (1.0 - ftot) * wtot / (1.0 - wtot * ftot)
+        gs = (gtot - ftot) / (1.0 - ftot)
+        lm = jnp.sqrt(3.0 * (1.0 - ws) * (1.0 - ws * gs))
+        ue = 1.5 * (1.0 - ws * gs) / lm
+        mu0n = mu0 if srftyp < 2 and kfrsnl > 0 else mu0nij
+        mu0n = jnp.where(k < kfrsnl, mu0n, mu0nij)
+        extins = jnp.exp(-jnp.minimum(10.0, lm * ts))
+        ne = (ue + 1.0) ** 2 / extins - (ue - 1.0) ** 2 * extins
+        rdifa = (ue ** 2 - 1.0) * (1.0 / extins - extins) / ne
+        tdifa = 4.0 * ue / ne
+        trn = jnp.exp(-jnp.minimum(10.0, ts / mu0n))
+        alp = 0.75 * ws * mu0n * (1.0 + gs * (1.0 - ws)) / (1.0 - lm ** 2 * mu0n ** 2)
+        gam = 0.5 * ws * (1.0 + 3.0 * gs * (1.0 - ws) * mu0n ** 2) / (1.0 - lm ** 2 * mu0n ** 2)
+        apg = alp + gam
+        amg = alp - gam
+        rdirk = apg * rdifa + amg * (tdifa * trn - 1.0)
+        tdirk = apg * tdifa + (amg * rdifa - apg + 1.0) * trn
 
-        def penetrating(_):
-            wtot = w0[k]
-            gtot = g[k]
-            ftot = gtot ** 2
-            ts = (1.0 - wtot * ftot) * tau[k]
-            ws = (1.0 - ftot) * wtot / (1.0 - wtot * ftot)
-            gs = (gtot - ftot) / (1.0 - ftot)
-            lm = jnp.sqrt(3.0 * (1.0 - ws) * (1.0 - ws * gs))
-            ue = 1.5 * (1.0 - ws * gs) / lm
-            mu0n = mu0 if srftyp < 2 and kfrsnl > 0 else mu0nij
-            mu0n = jnp.where(k < kfrsnl, mu0n, mu0nij)
-            extins = jnp.exp(-jnp.minimum(10.0, lm * ts))
-            ne = (ue + 1.0) ** 2 / extins - (ue - 1.0) ** 2 * extins
-            rdifa = (ue ** 2 - 1.0) * (1.0 / extins - extins) / ne
-            tdifa = 4.0 * ue / ne
-            trn = jnp.exp(-jnp.minimum(10.0, ts / mu0n))
-            alp = 0.75 * ws * mu0n * (1.0 + gs * (1.0 - ws)) / (1.0 - lm ** 2 * mu0n ** 2)
-            gam = 0.5 * ws * (1.0 + 3.0 * gs * (1.0 - ws) * mu0n ** 2) / (1.0 - lm ** 2 * mu0n ** 2)
-            apg = alp + gam
-            amg = alp - gam
-            rdirk = apg * rdifa + amg * (tdifa * trn - 1.0)
-            tdirk = apg * tdifa + (amg * rdifa - apg + 1.0) * trn
+        # Integrate the direct-beam solution over eight Gaussian angles
+        # to obtain the diffuse reflectance and transmission.
+        ext = jnp.exp(-jnp.minimum(10.0, ts / gauspt))
+        alps = 0.75 * ws * gauspt * (1.0 + gs * (1.0 - ws)) / (1.0 - lm ** 2 * gauspt ** 2)
+        gams = 0.5 * ws * (1.0 + 3.0 * gs * (1.0 - ws) * gauspt ** 2) / (1.0 - lm ** 2 * gauspt ** 2)
+        apgs = alps + gams
+        amgs = alps - gams
+        rdr = apgs * rdifa + amgs * tdifa * ext - amgs
+        tdr = apgs * tdifa + amgs * rdifa * ext - apgs * ext + ext
+        # Preserve Fortran's angular sum and product order.
+        swt = jnp.zeros_like(ts)
+        smr = jnp.zeros_like(ts)
+        smt = jnp.zeros_like(ts)
+        for ng in range(8):
+            swt = swt + gauspt[ng] * gauswt[ng]
+            smr = smr + gauspt[ng] * rdr[ng] * gauswt[ng]
+            smt = smt + gauspt[ng] * tdr[ng] * gauswt[ng]
+        rdifa = smr / swt
+        tdifa = smt / swt
+        rdifb = rdifa
+        tdifb = tdifa
 
-            # Integrate the direct-beam solution over eight Gaussian angles
-            # to obtain the diffuse reflectance and transmission.
-            ext = jnp.exp(-jnp.minimum(10.0, ts / gauspt))
-            alps = 0.75 * ws * gauspt * (1.0 + gs * (1.0 - ws)) / (1.0 - lm ** 2 * gauspt ** 2)
-            gams = 0.5 * ws * (1.0 + 3.0 * gs * (1.0 - ws) * gauspt ** 2) / (1.0 - lm ** 2 * gauspt ** 2)
-            apgs = alps + gams
-            amgs = alps - gams
-            rdr = apgs * rdifa + amgs * tdifa * ext - amgs
-            tdr = apgs * tdifa + amgs * rdifa * ext - apgs * ext + ext
-            # Preserve Fortran's angular sum and product order.
-            swt = jnp.zeros_like(ts)
-            smr = jnp.zeros_like(ts)
-            smt = jnp.zeros_like(ts)
-            for ng in range(8):
-                swt = swt + gauspt[ng] * gauswt[ng]
-                smr = smr + gauspt[ng] * rdr[ng] * gauswt[ng]
-                smt = smt + gauspt[ng] * tdr[ng] * gauswt[ng]
-            rdifa = smr / swt
-            tdifa = smt / swt
-            rdifb = rdifa
-            tdifb = tdifa
+        def fresnel(values):
+            rdirk, rdifa, rdifb, tdirk, tdifa, tdifb, trn = values
+            R1 = (mu0 - refindx * mu0n) / (mu0 + refindx * mu0n)
+            R2 = (refindx * mu0 - mu0n) / (refindx * mu0 + mu0n)
+            T1 = 2.0 * mu0 / (mu0 + refindx * mu0n)
+            T2 = 2.0 * mu0 / (refindx * mu0 + mu0n)
+            Rf_dir_a = 0.5 * (R1 ** 2 + R2 ** 2)
+            Tf_dir_a = 0.5 * (T1 ** 2 + T2 ** 2) * refindx * mu0n / mu0
+            Rf_dif_a, Rf_dif_b = 0.063, 0.455
+            Tf_dif_a, Tf_dif_b = 1.0 - Rf_dif_a, 1.0 - Rf_dif_b
+            rintfc = 1.0 / (1.0 - Rf_dif_b * rdifa)
+            tdir_new = (Tf_dir_a * tdirk
+                        + Tf_dir_a * rdirk * Rf_dif_b * rintfc * tdifa)
+            rdir_new = Rf_dir_a + Tf_dir_a * rdirk * rintfc * Tf_dif_b
+            rdifa_new = Rf_dif_a + Tf_dif_a * rdifa * rintfc * Tf_dif_b
+            rdifb_new = rdifb + tdifb * Rf_dif_b * rintfc * tdifa
+            return (rdir_new, rdifa_new, rdifb_new, tdir_new,
+                    tdifa * rintfc * Tf_dif_a,
+                    tdifb * rintfc * Tf_dif_b, Tf_dir_a * trn)
 
-            def fresnel(values):
-                rdirk, rdifa, rdifb, tdirk, tdifa, tdifb, trn = values
-                R1 = (mu0 - refindx * mu0n) / (mu0 + refindx * mu0n)
-                R2 = (refindx * mu0 - mu0n) / (refindx * mu0 + mu0n)
-                T1 = 2.0 * mu0 / (mu0 + refindx * mu0n)
-                T2 = 2.0 * mu0 / (refindx * mu0 + mu0n)
-                Rf_dir_a = 0.5 * (R1 ** 2 + R2 ** 2)
-                Tf_dir_a = 0.5 * (T1 ** 2 + T2 ** 2) * refindx * mu0n / mu0
-                Rf_dif_a, Rf_dif_b = 0.063, 0.455
-                Tf_dif_a, Tf_dif_b = 1.0 - Rf_dif_a, 1.0 - Rf_dif_b
-                rintfc = 1.0 / (1.0 - Rf_dif_b * rdifa)
-                tdir_new = (Tf_dir_a * tdirk
-                            + Tf_dir_a * rdirk * Rf_dif_b * rintfc * tdifa)
-                rdir_new = Rf_dir_a + Tf_dir_a * rdirk * rintfc * Tf_dif_b
-                rdifa_new = Rf_dif_a + Tf_dif_a * rdifa * rintfc * Tf_dif_b
-                rdifb_new = rdifb + tdifb * Rf_dif_b * rintfc * tdifa
-                return (rdir_new, rdifa_new, rdifb_new, tdir_new,
-                        tdifa * rintfc * Tf_dif_a,
-                        tdifb * rintfc * Tf_dif_b, Tf_dir_a * trn)
+        return jax.lax.cond(k == kfrsnl, fresnel, lambda x: x,
+                            (rdirk, rdifa, rdifb, tdirk, tdifa, tdifb, trn))
 
-            return jax.lax.cond(k == kfrsnl, fresnel, lambda x: x,
-                                (rdirk, rdifa, rdifb, tdirk, tdifa, tdifb, trn))
 
-        values = jax.lax.cond(trntdr[k] > 0.001, penetrating,
+
+    def descend(carry, k):
+        trndir, trntdr, trndif, rdndif = carry
+        values = jax.lax.cond(trntdr > 0.001, lambda _: layer_optics(k),
                               lambda _: (tau[k] * 0.0,) * 7, None)
         rdirk, rdifa, rdifb, tdirk, tdifa, tdifb, trnk = values
-        rdir = rdir.at[k].set(rdirk)
-        rdif_a = rdif_a.at[k].set(rdifa)
-        rdif_b = rdif_b.at[k].set(rdifb)
-        tdir = tdir.at[k].set(tdirk)
-        tdif_a = tdif_a.at[k].set(tdifa)
-        tdif_b = tdif_b.at[k].set(tdifb)
-        trnlay = trnlay.at[k].set(trnk)
-        trndir = trndir.at[k + 1].set(trndir[k] * trnk)
-        refkm1 = 1.0 / (1.0 - rdndif[k] * rdifa)
-        tdrrdir = trndir[k] * rdirk
-        tdndif = trntdr[k] - trndir[k]
-        trntdr = trntdr.at[k + 1].set(
-            trndir[k] * tdirk + (tdndif + tdrrdir * rdndif[k]) * refkm1 * tdifa)
-        rdndif = rdndif.at[k + 1].set(rdifb + tdifb * rdndif[k] * refkm1 * tdifa)
-        trndif = trndif.at[k + 1].set(trndif[k] * refkm1 * tdifa)
-        return (trndir, trntdr, trndif, rdndif, rdir, rdif_a, rdif_b,
-                tdir, tdif_a, tdif_b, trnlay)
+        refkm1 = 1.0 / (1.0 - rdndif * rdifa)
+        tdrrdir = trndir * rdirk
+        tdndif = trntdr - trndir
+        following = (
+            trndir * trnk,
+            trndir * tdirk + (tdndif + tdrrdir * rdndif) * refkm1 * tdifa,
+            trndif * refkm1 * tdifa,
+            rdifb + tdifb * rdndif * refkm1 * tdifa)
+        following = tuple(jnp.asarray(value, dtype=tau.dtype) for value in following)
+        optics = tuple(jnp.asarray(value, dtype=tau.dtype) for value in values)
+        return following, (following, optics)
 
-    (trndir, trntdr, trndif, rdndif, rdir, rdif_a, rdif_b,
-     tdir, tdif_a, tdif_b, trnlay) = jax.lax.fori_loop(
-         0, klev + 1, descend,
-         (trndir, trntdr, trndif, rdndif, rdir, rdif_a, rdif_b,
-          tdir, tdif_a, tdif_b, trnlay))
+    zero = jnp.zeros((), dtype=tau.dtype)
+    one = jnp.ones((), dtype=tau.dtype)
+    # Unroll the short layer sweeps to avoid launching kernels for each layer.
+    _, (downward, optics) = jax.lax.scan(
+        descend, (one, one, one, zero), jnp.arange(klev + 1), unroll=True)
+    trndir, trntdr, trndif, rdndif = tuple(
+        jnp.concatenate((top[None], values))
+        for top, values in zip((one, one, one, zero), downward))
 
-    rupdir = jnp.zeros(klevp + 1, dtype=tau.dtype).at[klevp].set(albodr)
-    rupdif = jnp.zeros(klevp + 1, dtype=tau.dtype).at[klevp].set(albodf)
-
-    def ascend(index, carry):
+    def ascend(carry, values):
         rupdir, rupdif = carry
-        k = klev - index
-        refkp1 = 1.0 / (1.0 - rdif_b[k] * rupdif[k + 1])
-        direct = rdir[k] + (trnlay[k] * rupdir[k + 1]
-                           + (tdir[k] - trnlay[k]) * rupdif[k + 1]) * refkp1 * tdif_b[k]
-        diffuse = rdif_a[k] + tdif_a[k] * rupdif[k + 1] * refkp1 * tdif_b[k]
-        return rupdir.at[k].set(direct), rupdif.at[k].set(diffuse)
+        rdir, rdif_a, rdif_b, tdir, tdif_a, tdif_b, trnlay = values
+        refkp1 = 1.0 / (1.0 - rdif_b * rupdif)
+        direct = rdir + (trnlay * rupdir + (tdir - trnlay) * rupdif) * refkp1 * tdif_b
+        diffuse = rdif_a + tdif_a * rupdif * refkp1 * tdif_b
+        following = (jnp.asarray(direct, dtype=tau.dtype),
+                     jnp.asarray(diffuse, dtype=tau.dtype))
+        return following, following
 
-    rupdir, rupdif = jax.lax.fori_loop(0, klev + 1, ascend, (rupdir, rupdif))
+    bottom = (jnp.asarray(albodr, dtype=tau.dtype), jnp.asarray(albodf, dtype=tau.dtype))
+    _, upward = jax.lax.scan(ascend, bottom, optics, reverse=True, unroll=True)
+    rupdir, rupdif = tuple(jnp.concatenate((values, base[None]))
+                          for values, base in zip(upward, bottom))
     return trndir, trntdr, trndif, rupdir, rupdif, rdndif
 
 

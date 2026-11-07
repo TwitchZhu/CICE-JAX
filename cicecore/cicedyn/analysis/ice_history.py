@@ -350,70 +350,74 @@ def init_hist(dt):
         return gather
 
     def times(left, right):
-        def gather():
-            return left() * right()
-        return gather
+        return ice_history_shared.device_gather(
+            lambda x, y: x * y, lambda: (left(), right()))
 
     def speed(u_name, v_name, module):
-        def gather():
-            u = getattr(module, u_name)
-            v = getattr(module, v_name)
-            return jnp.sqrt(u * u + v * v)
-        return gather
+        return ice_history_shared.device_gather(
+            lambda u, v: jnp.sqrt(u * u + v * v),
+            lambda: (getattr(module, u_name), getattr(module, v_name)))
 
     def direction(u_name, v_name, module):
         # atan2 is applied only when the vector is larger than puny.
         # The 180 degree offset is applied on every cell, matching
         # the Fortran statement that sits outside that test.
-        def gather():
-            u = getattr(module, u_name)
-            v = getattr(module, v_name)
+        def compute(u, v):
             puny = queried["puny"]
             rad_to_deg = queried["rad_to_deg"]
             moving = (jnp.abs(u) > puny) | (jnp.abs(v) > puny)
             work = jnp.where(moving, jnp.arctan2(u, v) * rad_to_deg, c0) + c180
             return work
-        return gather
+        return ice_history_shared.device_gather(
+            compute, lambda: (getattr(module, u_name), getattr(module, v_name)))
 
-    def sice():
+    def sice_compute(trcr, aice):
         # volume-weighted layers are stored consecutively from nt_sice.
         # The written value is their unweighted mean.
         nt = int(icepack_tracers.nt_sice)
         nilyr = int(ice_domain_size.nilyr)
-        work = jnp.zeros(ice_state.aice.shape, dtype=dbl_kind)
+        work = jnp.zeros(aice.shape, dtype=dbl_kind)
         if nt < 0 or nilyr < 1:
             return work
         for k in range(nilyr):
-            work = work + ice_state.trcr[:, :, nt + k]
+            work = work + trcr[:, :, nt + k]
         return work / dbl_kind(nilyr)
 
+    sice = ice_history_shared.device_gather(
+        sice_compute, lambda: (ice_state.trcr, ice_state.aice))
+
     def tracer(index_name):
-        def gather():
+        def compute(trcr, aice):
             nt = int(getattr(icepack_tracers, index_name))
             if nt < 0:
-                return jnp.zeros(ice_state.aice.shape, dtype=dbl_kind)
-            return ice_state.trcr[:, :, nt]
-        return gather
+                return jnp.zeros(aice.shape, dtype=dbl_kind)
+            return trcr[:, :, nt]
+        return ice_history_shared.device_gather(
+            compute, lambda: (ice_state.trcr, ice_state.aice))
 
-    def ice_present():
+    def ice_present_compute(aice):
         puny = queried["puny"]
-        return jnp.where(ice_state.aice > puny, c1, c0)
+        return jnp.where(aice > puny, c1, c0)
 
-    def ocndir():
+    ice_present = ice_history_shared.device_gather(
+        ice_present_compute, lambda: (ice_state.aice,))
+
+    def ocndir_compute(u, v):
         # going to, folded into [0, 360), unlike icedir and atmdir
         puny = queried["puny"]
         rad_to_deg = queried["rad_to_deg"]
-        u = ice_flux.uocn
-        v = ice_flux.vocn
         moving = (jnp.abs(u) > puny) | (jnp.abs(v) > puny)
         work = jnp.where(moving, jnp.arctan2(u, v) * rad_to_deg, c0)
         return jnp.where(work < c0, work + c360, work)
 
-    def albsni():
-        return (queried["awtvdr"] * ice_flux.alvdr_ai
-                + queried["awtidr"] * ice_flux.alidr_ai
-                + queried["awtvdf"] * ice_flux.alvdf_ai
-                + queried["awtidf"] * ice_flux.alidf_ai)
+    ocndir = ice_history_shared.device_gather(
+        ocndir_compute, lambda: (ice_flux.uocn, ice_flux.vocn))
+
+    albsni = ice_history_shared.device_gather(
+        lambda alvdr, alidr, alvdf, alidf: (
+            queried["awtvdr"] * alvdr + queried["awtidr"] * alidr
+            + queried["awtvdf"] * alvdf + queried["awtidf"] * alidf),
+        lambda: (ice_flux.alvdr_ai, ice_flux.alidr_ai, ice_flux.alvdf_ai, ice_flux.alidf_ai))
 
     def trsig():
         if int(ice_init.kdyn) == 2:  # for EAP dynamics different time of output
@@ -872,14 +876,13 @@ def init_hist(dt):
     ncat = ice_history_shared.ncat_hist
 
     def categories(array):
-        def gather():
-            return jnp.asarray(array())[:, :, :ncat]
-        return gather
+        return ice_history_shared.device_gather(
+            lambda value: jnp.asarray(value)[:, :, :ncat], lambda: (array(),))
 
     def category_product(left, right):
-        def gather():
-            return jnp.asarray(left())[:, :, :ncat] * jnp.asarray(right())[:, :, :ncat]
-        return gather
+        return ice_history_shared.device_gather(
+            lambda x, y: jnp.asarray(x)[:, :, :ncat] * jnp.asarray(y)[:, :, :ncat],
+            lambda: (left(), right()))
 
     def fmelttn():
         # net surface heat flux that causes melt

@@ -266,6 +266,20 @@ def step_therm1(pytree, static, timing=None):
         "Qa_iso", "Qref_iso", "fiso_atm", "fiso_ocn", "fiso_evap",
         "HDO_ocn", "H2_16O_ocn", "H2_18O_ocn", "dsnown",
     )
+    if not options["profile_picard"] and not options["debug_model_ponds_inputs"]:
+        updates = _therm1_compiled(
+            ice, flux, column, bgc, icep, grid, dimensions["physical_bounds"],
+            tuple(sorted(tracers.items())), nilyr, nslyr, nfsd,
+            tuple(sorted(options.items())),
+            (ice_names, flux_names, column_names, bgc_names), parameters,
+            static["ice_calendar"]["dt"], static["ice_calendar"]["yday"])
+        for name, original, changes in zip(
+                ("ice_state", "ice_flux", "ice_arrays_column", "ice_flux_bgc", "ice_step_mod"),
+                (ice, flux, column, bgc, icep), updates):
+            state[name] = {**original, **changes}
+        result = {**pytree, "state": state}
+        ice_timers.record_stage(timing, "physics.therm1.compiled", stage_started, result)
+        return result
     flattened, valid = _therm1_prepare(
         ice, flux, column, bgc, icep, grid, dimensions["physical_bounds"],
         tuple(sorted(tracers.items())), nilyr, nslyr, nfsd,
@@ -426,18 +440,38 @@ def step_therm1(pytree, static, timing=None):
                     options["debug_replay_atmo_coefficients"],
                     options["debug_replay_atmo_psi"], options["debug_replay_atmo_math"]),
                 jnp.stack(atmo_samples), jnp.stack(picard_samples), ordered=True)
-    ice, flux, column, bgc, icep = _therm1_writeback(
+    updates = _therm1_writeback(
         ice, flux, column, bgc, icep, flattened, advanced,
         failed, aerosol_warning, valid, dimensions["physical_bounds"],
         tuple(sorted(tracers.items())), bool(options["snwgrain"]),
         (ice_names, flux_names, column_names, bgc_names), parameters["puny"])
-    state.update({"ice_state": ice, "ice_flux": flux,
-                  "ice_arrays_column": column, "ice_flux_bgc": bgc,
-                  "ice_step_mod": icep})
+    for name, original, changes in zip(
+            ("ice_state", "ice_flux", "ice_arrays_column", "ice_flux_bgc", "ice_step_mod"),
+            (ice, flux, column, bgc, icep), updates):
+        state[name] = {**original, **changes}
     result = dict(pytree)
     result["state"] = state
     ice_timers.record_stage(timing, "physics.therm1.writeback", stage_started, result)
     return result
+
+
+@partial(jax.jit, static_argnames=("bounds", "tracers", "nilyr", "nslyr", "nfsd",
+                                 "options", "field_names"))
+def _therm1_compiled(ice, flux, column, bgc, icep, grid, bounds, tracers,
+                     nilyr, nslyr, nfsd, options, field_names, parameters, dt, yday):
+    # Keep extracted fields and solver intermediates inside one executable.
+    options = dict(options)
+    flattened, valid = _therm1_prepare(
+        ice, flux, column, bgc, icep, grid, bounds, tracers, nilyr, nslyr, nfsd,
+        bool(options["snwgrain"]), bool(options["picard_batch_stop"]), field_names)
+    advanced, failed, aerosol_warning = icepack_step_therm1_batch(
+        dt, yday, flattened, options, parameters,
+        column["floe_rad_c"] if nfsd else None,
+        column["floe_binwidth"] if nfsd else None)
+    return _therm1_writeback(
+        ice, flux, column, bgc, icep, flattened, advanced,
+        failed, aerosol_warning, valid, bounds, tracers,
+        bool(options["snwgrain"]), field_names, parameters["puny"])
 
 
 @jax.profiler.annotate_function
@@ -556,6 +590,7 @@ def _therm1_writeback(ice, flux, column, bgc, icep, flattened, advanced,
                       failed, aerosol_warning, valid, bounds, tracers,
                       snwgrain, field_names, puny):
     """Mask and write therm1 outputs in one compiled device operation."""
+    original_groups = (ice, flux, column, bgc, icep)
     ice, flux, column, bgc, icep = (
         dict(ice), dict(flux), dict(column), dict(bgc), dict(icep))
     tracers = dict(tracers)
@@ -653,7 +688,10 @@ def _therm1_writeback(ice, flux, column, bgc, icep, flattened, advanced,
         failed.reshape(cell_shape) & valid.reshape(cell_shape))
     icep["therm1_aerosol_warning"] = icep["therm1_aerosol_warning"].at[cells].set(
         aerosol_warning.reshape(cell_shape) & valid.reshape(cell_shape))
-    return ice, flux, column, bgc, icep
+    # Tracer identity selects reassigned fields at trace time, not by value.
+    return tuple({name: value for name, value in after.items()
+                  if value is not before[name]}
+                 for before, after in zip(original_groups, (ice, flux, column, bgc, icep)))
 
 
 def biogeochemistry(pytree, static):
@@ -1227,13 +1265,14 @@ def step_dyn_ridge(pytree, static, timing=None):
             flattened, partial(_timed_column_call, timing, "physics.ridge.columns"))
     ice_timers.record_stage(timing, "physics.ridge.columns", stage_started, (advanced, failed))
     stage_started = time.perf_counter()
-    ice, flux, bgc, column, icep = _ridge_writeback(
+    updates = _ridge_writeback(
         ice, flux, bgc, column, icep, pytree["constants"]["ice_grid"]["tmask"],
         flattened, advanced, failed, static["ice_domain_size"]["physical_bounds"],
         (n_aero, n_iso, nbtrcr), field_names)
-    state.update({"ice_state": ice, "ice_flux": flux,
-                  "ice_flux_bgc": bgc, "ice_arrays_column": column,
-                  "ice_step_mod": icep})
+    for name, original, changes in zip(
+            ("ice_state", "ice_flux", "ice_flux_bgc", "ice_arrays_column", "ice_step_mod"),
+            (ice, flux, bgc, column, icep), updates):
+        state[name] = {**original, **changes}
     result = dict(pytree)
     result["state"] = state
     ice_timers.record_stage(timing, "physics.ridge.writeback", stage_started, result)
@@ -1279,6 +1318,7 @@ def _ridge_prepare(ice, flux, bgc, column, bounds, counts, field_names):
 def _ridge_writeback(ice, flux, bgc, column, icep, tmask, flattened, advanced,
                       failed, bounds, counts, field_names):
     """Fuse ocean masking and ridge output updates in one compiled operation."""
+    original_groups = (ice, flux, bgc, column, icep)
     ice, flux, bgc, column, icep = (
         dict(ice), dict(flux), dict(bgc), dict(column), dict(icep))
     ilo, ihi, jlo, jhi = bounds
@@ -1305,7 +1345,9 @@ def _ridge_writeback(ice, flux, bgc, column, icep, tmask, flattened, advanced,
     column["hin_max"] = column["hin_max"].at[-1].set(1.0e8)
     icep["ridge_failed"] = icep["ridge_failed"].at[cells].set(
         failed.reshape(cell_shape) & valid.reshape(cell_shape))
-    return ice, flux, bgc, column, icep
+    return tuple({name: value for name, value in after.items()
+                  if value is not before[name]}
+                 for before, after in zip(original_groups, (ice, flux, bgc, column, icep)))
 
 
 @jax.profiler.annotate_function
@@ -1319,25 +1361,47 @@ def update_state(pytree, static, dt, offset=None, tendency=None):
     config = tuple((name, tuple(sorted(static[name].items()))) for name in (
         "ice_domain_size", "ice_domain", "ice_state_tracers",
         "icepack_tracers", "icepack_parameters"))
-    return _update_state_compiled(
-        pytree, config, dt, offset, tendency, offset is not None and offset > 0)
+    state = dict(pytree["state"])
+    ice = {name: state["ice_state"][name]
+           for name in ("aicen", "trcrn", "vicen", "vsnon")}
+    flux_names = ["Tf"]
+    if offset is not None:
+        suffix = "t" if tendency == "thermo" else "d"
+        flux_names.extend(name + suffix for name in ("daidt", "dvidt", "dvsdt"))
+        if bool(static["icepack_tracers"]["tr_iage"]):
+            flux_names.append("dagedt" + suffix)
+    flux = {name: state["ice_flux"][name] for name in flux_names}
+    parameter_names = ["puny"]
+    if str(static["icepack_parameters"]["snwredist"])[:3] == "ITD":
+        parameter_names.append("rhosnew")
+    if bool(static["icepack_parameters"]["snwgrain"]):
+        parameter_names.extend(("rsnw_fall", "rhos"))
+    parameters = {name: pytree["parameters"]["icepack_parameters"][name]
+                  for name in parameter_names}
+    ice_updates, flux_updates = _update_state_compiled(
+        ice, flux, parameters, pytree["constants"]["ice_boundary"]["iglob"],
+        config, dt, offset, tendency, offset is not None and offset > 0)
+    state["ice_state"] = {**state["ice_state"], **ice_updates}
+    state["ice_flux"] = {**state["ice_flux"], **flux_updates}
+    result = dict(pytree)
+    result["state"] = state
+    return result
 
 
 @partial(jax.jit, static_argnames=("config", "tendency", "positive_offset"))
-def _update_state_compiled(pytree, config, dt, offset, tendency, positive_offset):
+def _update_state_compiled(ice, flux, parameters, iglob,
+                           config, dt, offset, tendency, positive_offset):
     # Select the age-tendency branch on the host; dt and offset stay dynamic.
     static = {name: dict(values) for name, values in config}
-    state = dict(pytree["state"])
-    ice = dict(state["ice_state"])
-    flux = dict(state["ice_flux"])
-    iglob = pytree["constants"]["ice_boundary"]["iglob"]
+    ice = dict(ice)
+    flux = dict(flux)
     for name in ("aicen", "trcrn", "vicen", "vsnon"):
         ice[name] = ice_halo_update_center_jax(ice[name], static, iglob)
 
     aice, trcr, vice, vsno, aice0 = icepack_aggregate_jax(
         ice["aicen"], ice["trcrn"], ice["vicen"], ice["vsnon"],
         flux["Tf"], static["ice_state_tracers"], static["icepack_tracers"],
-        static["icepack_parameters"], pytree["parameters"]["icepack_parameters"],
+        static["icepack_parameters"], parameters,
     )
     ice["aice"] = aice
     ice["trcr"] = trcr
@@ -1358,11 +1422,8 @@ def _update_state_compiled(pytree, config, dt, offset, tendency, positive_offset
             else:
                 flux[key] = (age - flux[key]) / dt
 
-    state["ice_state"] = ice
-    state["ice_flux"] = flux
-    result = dict(pytree)
-    result["state"] = state
-    return result
+    del flux["Tf"]
+    return ice, flux
 
 
 def step_snow(pytree, static):

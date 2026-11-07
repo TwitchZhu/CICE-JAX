@@ -99,6 +99,13 @@ def _diagnostic_snapshot(pytree, progress, step_number, stage, step_start):
     progress.flush()
 
 
+_ATMOSPHERE_FIELDS = (
+    "Tair", "fsw", "flw", "frain", "fsnow", "Qa",
+    "rhoa", "uatm", "vatm", "strax", "stray", "zlvl",
+    "wind", "swvdr", "swvdf", "swidr", "swidf", "potT",
+)
+
+
 def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5, 7),
              detailed_physics_steps=None):
     """Advance CICE, keeping the file and calendar work on the host."""
@@ -106,13 +113,14 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
     if profile_dir is not None and not (1 <= profile_start <= profile_end):
         raise ValueError("profile_steps must be an inclusive positive step range")
     profile_active = False
-    diagnostic_values = ice_diagnostics.make_runtime_diags(static)
+    diagnostic_values, unpack_diagnostics = ice_diagnostics.make_runtime_diags(
+        static, pytree, ice_calendar.dt)
     if ice_history_shared.avail_hist_fields:
         ice_history_shared.start_device_history()
-    status_counts = jax.jit(lambda status: {
-        name: jnp.count_nonzero(value) for name, value in status.items()
-        if name.endswith(("_failed", "_error", "_warning"))
-    })
+    status_names = tuple(name for name in pytree["state"]["ice_step_mod"]
+                         if name.endswith(("_failed", "_error", "_warning")))
+    status_counts = jax.jit(lambda status: jnp.stack([
+        jnp.count_nonzero(status[name]) for name in status_names]))
     pending_forcing = {}
     ice_fileunits.nu_diag.write(
         "TIMING enabled: synchronized wall time includes dispatch and compilation.\n"
@@ -124,6 +132,7 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
     #--------------------------------------------------------------------
     # initialize error code and step timer
     #--------------------------------------------------------------------
+    ice_timers.configure_timer_scopes(static)
     ice_timers.ice_timer_start(ice_timers.timer_step)
     try:
         #--------------------------------------------------------------------
@@ -135,7 +144,8 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                 jax.block_until_ready(pytree)
                 jax.effects_barrier()
                 Path(profile_dir).mkdir(parents=True, exist_ok=True)
-                jax.profiler.start_trace(str(profile_dir), create_perfetto_trace=True)
+                with ice_timers.timing_phase("profiling"):
+                    jax.profiler.start_trace(str(profile_dir), create_perfetto_trace=True)
                 profile_active = True
                 ice_fileunits.nu_diag.write(
                     f"PROFILE started steps={profile_start}-{profile_end} directory={profile_dir}\n")
@@ -173,7 +183,7 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
             device_counts = status_counts(step_status)
             ice_timers.record_stage(timing, "status.compute_gpu", status_started, device_counts)
             stage_started = time.perf_counter()
-            counts = jax.device_get(device_counts)
+            counts = dict(zip(status_names, jax.device_get(device_counts)))
             ice_timers.record_stage(timing, "status.d2h", stage_started)
             failures = []
             for name in (
@@ -233,7 +243,7 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                 device_report = diagnostic_values(pytree, ice_calendar.dt)
                 ice_timers.record_stage(timing, "diagnostics.compute_gpu", stage_started, device_report)
                 stage_started = time.perf_counter()
-                report = jax.device_get(device_report)
+                report = unpack_diagnostics(jax.device_get(device_report))
                 ice_timers.record_stage(timing, "diagnostics.d2h", stage_started)
 
             # Catalog callbacks see device arrays; the scope restores CPU
@@ -254,11 +264,11 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                 ice_timers.ice_timer_start(ice_timers.timer_hist)
                 try:
                     pytree = ice_history.accum_hist(ice_calendar.dt, pytree=pytree, timing=timing)
+                    history_arrays = [getattr(ice_history_shared, name)
+                                      for _, name, _ in ice_history_shared._RANKS.values()]
+                    ice_timers.record_stage(timing, "history", stage_started, (pytree, history_arrays))
                 finally:
                     ice_timers.ice_timer_stop(ice_timers.timer_hist)
-                history_arrays = [getattr(ice_history_shared, name)
-                                  for _, name, _ in ice_history_shared._RANKS.values()]
-                ice_timers.record_stage(timing, "history", stage_started, (pytree, history_arrays))
 
             if ice_calendar.write_restart == 1:
                 restart_started = time.perf_counter()
@@ -363,7 +373,8 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                 jax.block_until_ready(pytree)
                 jax.effects_barrier()
                 profile_active = False
-                jax.profiler.stop_trace()
+                with ice_timers.timing_phase("profiling"):
+                    jax.profiler.stop_trace()
                 ice_fileunits.nu_diag.write(f"PROFILE saved directory={profile_dir}\n")
                 ice_fileunits.nu_diag.flush()
             if ice_calendar.stop_now >= 1:
@@ -403,29 +414,16 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                 flux = dict(old_flux)
                 bgc = dict(old_bgc)
                 column = dict(state["ice_arrays_column"])
-                if str(ice_init.atm_data_type).strip() != "default":
-                    for name in (
-                        "Tair", "fsw", "flw", "frain", "fsnow", "Qa",
-                        "rhoa", "uatm", "vatm", "strax", "stray", "zlvl",
-                        "wind", "swvdr", "swvdf", "swidr", "swidf", "potT",
-                    ):
+                atmosphere = None
+                if "JRA55" in str(ice_init.atm_data_type):
+                    atmosphere = jnp.asarray(np.stack([
+                        getattr(ice_flux, name) for name in _ATMOSPHERE_FIELDS]))
+                elif str(ice_init.atm_data_type).strip() != "default":
+                    for name in _ATMOSPHERE_FIELDS:
                         flux[name] = jnp.asarray(getattr(ice_flux, name))
                     if str(ice_init.atm_data_type).strip() == "hadgem":
                         for name in ("fsurfn_f", "fcondtopn_f", "flatn_f"):
                             flux[name] = jnp.asarray(getattr(ice_flux, name))
-                    if "JRA55" in str(ice_init.atm_data_type):
-                        # The cap precedes masking and precipitation splitting
-                        # in JRA55_data/prepare_forcing. Its threshold is above
-                        # freezing, so the rain/snow classification is unchanged.
-                        hm = pytree["constants"]["ice_grid"]["hm"]
-                        tair = flux["Tair"]
-                        tair = jnp.where(state["ice_state"]["aice"] > 0.1,
-                                         jnp.minimum(tair, (pytree["parameters"]["icepack_parameters"]["Tffresh"] + 0.1) * hm),
-                                         tair)
-                        flux["Tair"] = tair
-                        ilo, ihi, jlo, jhi = ice_domain_size.physical_bounds()
-                        cell = (slice(ilo, ihi + 1), slice(jlo, jhi + 1))
-                        flux["potT"] = flux["potT"].at[cell].set(tair[cell])
                 ocn_type = str(ice_init.ocn_data_type).strip()
                 if ocn_type == "clim":
                     ocean_fields = ("sss", "Tf")
@@ -444,22 +442,31 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                     ocean_fields = ()
                 for name in ocean_fields:
                     flux[name] = jnp.asarray(getattr(ice_flux, name))
-                for name in (
+                clear_flux = {name: old_flux[name] for name in (
                     "strairxT", "strairyT", "fsurf", "fcondtop", "fsens",
                     "flat", "fswabs", "flwout", "evap", "evaps", "evapi",
                     "Tref", "Qref", "Uref", "fresh", "fsalt", "fpond",
                     "fhocn", "fswthru", "fswthru_vdr", "fswthru_vdf",
                     "fswthru_idr", "fswthru_idf", "fswthru_uvrdr",
                     "fswthru_uvrdf", "fswthru_pardr", "fswthru_pardf",
-                ):
-                    flux[name] = jnp.zeros_like(old_flux[name])
+                )}
                 if bool(ice_flux.send_i2x_per_cat):
-                    flux["fswthrun_ai"] = jnp.zeros_like(old_flux["fswthrun_ai"])
-                for name in (
+                    clear_flux["fswthrun_ai"] = old_flux["fswthrun_ai"]
+                clear_bgc = {name: old_bgc[name] for name in (
                     "fiso_evap", "Qref_iso", "Qa_iso", "faero_ocn",
                     "fiso_ocn", "HDO_ocn", "H2_16O_ocn", "H2_18O_ocn",
-                ):
-                    bgc[name] = jnp.zeros_like(old_bgc[name])
+                )}
+                temperature = None
+                if "JRA55" in str(ice_init.atm_data_type):
+                    temperature = (
+                        flux["Tair"], flux["potT"], state["ice_state"]["aice"],
+                        pytree["constants"]["ice_grid"]["hm"],
+                        pytree["parameters"]["icepack_parameters"]["Tffresh"])
+                flux_updates, bgc_updates = _forcing_prepare_compiled(
+                    clear_flux, clear_bgc, temperature, ice_domain_size.physical_bounds(),
+                    atmosphere=atmosphere)
+                flux.update(flux_updates)
+                bgc.update(bgc_updates)
                 if bool(icepack_tracers.tr_iso):
                     bgc["fiso_atm"] = jnp.asarray(ice_flux_bgc.fiso_atm)
                 if bool(icepack_tracers.tr_aero) or bool(icepack_tracers.tr_zaero):
@@ -580,20 +587,48 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
     finally:
         ice_timers.ice_timer_stop(ice_timers.timer_step)
         if profile_active:
-            jax.profiler.stop_trace()
+            with ice_timers.timing_phase("profiling"):
+                jax.profiler.stop_trace()
 
     return pytree
+
+
+@jax.profiler.annotate_function
+@partial(jax.jit, static_argnames=("bounds",))
+def _forcing_prepare_compiled(clear_flux, clear_bgc, temperature, bounds, atmosphere=None):
+    """Unpack JRA55 inputs with flux resets and the state-dependent cap."""
+    flux = ({name: atmosphere[index] for index, name in enumerate(_ATMOSPHERE_FIELDS)}
+            if atmosphere is not None else {})
+    if temperature is not None:
+        tair, potT, aice, hm, Tffresh = temperature
+        if atmosphere is not None:
+            tair, potT = flux["Tair"], flux["potT"]
+        # The cap is above freezing, so the host rain/snow split stays valid.
+        tair = jnp.where(aice > 0.1, jnp.minimum(tair, (Tffresh + 0.1) * hm), tair)
+        ilo, ihi, jlo, jhi = bounds
+        cell = (slice(ilo, ihi + 1), slice(jlo, jhi + 1))
+        flux["Tair"] = tair
+        flux["potT"] = potT.at[cell].set(tair[cell])
+    flux.update({name: jnp.zeros_like(value) for name, value in clear_flux.items()})
+    bgc = {name: jnp.zeros_like(value) for name, value in clear_bgc.items()}
+    return flux, bgc
 
 
 @jax.profiler.annotate_function
 @partial(jax.jit, static_argnames=("config",))
 def _physics_prepare_compiled(pytree, config):
     """Fuse diagnostic resets, initial snapshots and wind interpolation."""
+    original = pytree["state"]
     static = {name: dict(values) for name, values in config}
     pytree = ice_diagnostics.init_mass_diags(pytree, static)
     pytree = ice_flux.init_history_therm(pytree, static)
     pytree = ice_history_bgc.init_history_bgc(pytree, static)
-    return ice_step_mod.step_prep(pytree, static)
+    pytree = ice_step_mod.step_prep(pytree, static)
+    return {"state": {
+        group: {name: value for name, value in fields.items()
+                if value is not original[group][name]}
+        for group, fields in pytree["state"].items()
+    }}
 
 
 def ice_step(pytree, static, progress=None, diagnose=False, step_start=None, timing=None):
@@ -622,7 +657,11 @@ def ice_step(pytree, static, progress=None, diagnose=False, step_start=None, tim
     # Initialize diagnostics and save initial state values.
     prepare_config = tuple((name, tuple(sorted(static[name].items()))) for name in (
         "ice_domain_size", "ice_domain", "ice_init", "icepack_parameters", "icepack_tracers"))
-    pytree = _physics_prepare_compiled(pytree, prepare_config)
+    updates = _physics_prepare_compiled(pytree, prepare_config)
+    state = dict(pytree["state"])
+    for name, changes in updates["state"].items():
+        state[name] = {**state[name], **changes}
+    pytree = {**pytree, "state": state}
     ice_timers.record_stage(timing, "physics.prepare", stage_started, pytree)
     step_number = int(calendar["istep1"])
     if int(parameters["ktherm"]) >= 0:

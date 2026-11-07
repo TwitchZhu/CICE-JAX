@@ -10,6 +10,7 @@ __pycache__/
 
 # Local experiments and development notes
 /cases/
+/server_log/
 /函数文档.md
 /初始化状态.md
 /初始化评估计划.md

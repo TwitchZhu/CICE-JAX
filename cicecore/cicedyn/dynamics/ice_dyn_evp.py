@@ -173,7 +173,7 @@ def evp_subcycles(fields, strength, cdn_ocnU, grid, shared, params,
                 updated[name], "U", "vector", halo_static, iglob)
         return updated
 
-    return jax.lax.fori_loop(0, ndte, momentum_substep, fields)
+    return jax.lax.fori_loop(0, ndte, momentum_substep, fields, unroll=4)
 
 
 def evp(pytree, static, dt, solver="evp"):

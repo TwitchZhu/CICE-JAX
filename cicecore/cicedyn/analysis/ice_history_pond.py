@@ -89,44 +89,50 @@ def _add(name, unit, desc, comment, cona, conb, gather, rank="2D", avg_ice_prese
     )
 
 
-def _pond_fraction():
-    """Pond area fraction of the sea ice."""
-    flags = _flags()
-    work = jnp.zeros(ice_state.aice.shape, dtype=dbl_kind)
-    if flags["tr_pond_lvl"]:
-        work = ice_state.trcr[:, :, icepack_tracers.nt_alvl] * ice_state.trcr[:, :, icepack_tracers.nt_apnd]
-    elif flags["tr_pond_sealvl"] or flags["tr_pond_topo"]:
-        work = ice_state.trcr[:, :, icepack_tracers.nt_apnd]
-    return work
-
-
 def init_hist_pond_2D():
     """Register 2D melt-pond history fields."""
-    if not _prepare()["tr_pond"]:
+    flags = _prepare()
+    if not flags["tr_pond"]:
         return
 
-    def weighted():
-        return ice_state.aice_init * _pond_fraction()
+    def fraction(trcr, aice):
+        if flags["tr_pond_lvl"]:
+            return trcr[:, :, icepack_tracers.nt_alvl] * trcr[:, :, icepack_tracers.nt_apnd]
+        if flags["tr_pond_sealvl"] or flags["tr_pond_topo"]:
+            return trcr[:, :, icepack_tracers.nt_apnd]
+        return jnp.zeros(aice.shape, dtype=dbl_kind)
 
-    def depth():
-        return _pond_fraction() * ice_state.trcr[:, :, icepack_tracers.nt_hpnd]
+    def pond_inputs():
+        return ice_state.trcr, ice_state.aice
 
-    def lid():
-        return _pond_fraction() * ice_state.trcr[:, :, icepack_tracers.nt_ipnd]
+    def weighted_inputs():
+        return ice_state.trcr, ice_state.aice, ice_state.aice_init
 
-    def depth_ai():
-        return weighted() * ice_state.trcr[:, :, icepack_tracers.nt_hpnd]
+    pond_fraction = ice_history_shared.device_gather(fraction, pond_inputs)
+    weighted = ice_history_shared.device_gather(
+        lambda trcr, aice, area: area * fraction(trcr, aice), weighted_inputs)
+    depth = ice_history_shared.device_gather(
+        lambda trcr, aice: fraction(trcr, aice) * trcr[:, :, icepack_tracers.nt_hpnd], pond_inputs)
+    lid = ice_history_shared.device_gather(
+        lambda trcr, aice: fraction(trcr, aice) * trcr[:, :, icepack_tracers.nt_ipnd], pond_inputs)
+    depth_ai = ice_history_shared.device_gather(
+        lambda trcr, aice, area: (area * fraction(trcr, aice)) * trcr[:, :, icepack_tracers.nt_hpnd],
+        weighted_inputs)
+    lid_ai = ice_history_shared.device_gather(
+        lambda trcr, aice, area: (area * fraction(trcr, aice)) * trcr[:, :, icepack_tracers.nt_ipnd],
+        weighted_inputs)
 
-    def lid_ai():
-        return weighted() * ice_state.trcr[:, :, icepack_tracers.nt_ipnd]
+    puny = icepack_parameters.icepack_query_parameters("puny")["puny"]
 
-    def effective():
+    def effective_compute(aice, apeff_ai):
         # effective pond fraction of the ice, not of the grid cell
-        puny = icepack_parameters.icepack_query_parameters("puny")["puny"]
-        present = ice_state.aice > puny
-        return jnp.where(present, ice_flux.apeff_ai / jnp.where(present, ice_state.aice, c1), c0)
+        present = aice > puny
+        return jnp.where(present, apeff_ai / jnp.where(present, aice, c1), c0)
 
-    _add("apond", "1", "melt pond fraction of sea ice", "none", c1, c0, _pond_fraction)
+    effective = ice_history_shared.device_gather(
+        effective_compute, lambda: (ice_state.aice, ice_flux.apeff_ai))
+
+    _add("apond", "1", "melt pond fraction of sea ice", "none", c1, c0, pond_fraction)
     _add("apond_ai", "1", "melt pond fraction of grid cell", "weighted by ice area", c1, c0, weighted)
     _add("hpond", "m", "mean melt pond depth over sea ice", "none", c1, c0, depth)
     _add("hpond_ai", "m", "mean melt pond depth over grid cell", "weighted by ice area", c1, c0, depth_ai)
@@ -141,7 +147,7 @@ def init_hist_pond_2D():
     _add("dpnd_dlid", "m/s", "pond loss / gain to ice lid freezing / melting", "none", c1, c0, lambda: ice_flux.dpnd_dlid)
     _add("dpnd_melt", "m/s", "pond drainage due to ice melting", "none", c1, c0, lambda: ice_flux.dpnd_melt)
     _add("dpnd_ridge", "m", "pond drainage due to ridging", "none", c1, c0, lambda: ice_flux.dpnd_ridge)
-    _add("simpconc", "%", "percentage of sea ice covered by melt ponds", "area percentage of sea-ice surface that is covered by melt ponds", c100, c0, _pond_fraction)
+    _add("simpconc", "%", "percentage of sea ice covered by melt ponds", "area percentage of sea-ice surface that is covered by melt ponds", c100, c0, pond_fraction)
     _add("simpeffconc", "%", "percentage of sea ice covered by effective melt ponds", "area percentage of sea-ice surface that is covered by open melt ponds", c100, c0, lambda: ice_flux.apeff_ai)
     _add("simprefrozen", "m", "thickness of refrozen ice on melt ponds", "volume of refrozen ice on melt ponds divided by melt pond covered area", c1, c0, lid_ai, avg_ice_present="pond", mask_ice_free_points=True)
     _add("simpthick", "m", "melt pond depth", "average depth of melt ponds on sea ice, that is melt pond volume divided by melt pond area", c1, c0, depth_ai, avg_ice_present="pond", mask_ice_free_points=True)

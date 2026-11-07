@@ -932,14 +932,14 @@ def picard_solver(lsnow, lcold, Tsf, zqsn, zqin, zSin, zTin, zTsn,
                     return lax.fori_loop(
                         0, 8,
                         lambda offset, carry: iteration(4 + 8 * block_index + offset, carry),
-                        values)
+                        values, unroll=4)
 
                 return lax.cond(any_pending, advance_block, lambda values: values, values)
 
             return lax.fori_loop(0, 12, block, values)
 
         def solve_active(values):
-            values = lax.fori_loop(0, 4, iteration, values)
+            values = lax.fori_loop(0, 4, iteration, values, unroll=4)
             any_pending = lax.pmax(
                 (picard_active & ~values[18]).astype(jnp.int32), picard_axis_name) > 0
             return lax.cond(any_pending, remaining_blocks, lambda values: values, values)

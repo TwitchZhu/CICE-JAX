@@ -346,9 +346,24 @@ def zero_hist_slot(field):
         array[..., field.slot] = c0
 
 
+def device_gather(compute, inputs):
+    """Keep host reads separate from arithmetic that can join accumulation JIT."""
+    def gather():
+        return compute(*inputs())
+
+    gather.device_inputs = inputs
+    gather.device_compute = compute
+    return gather
+
+
 def start_device_history():
     """Move restored sums once, and compile a masked update for this catalog."""
-    global _device_accumulate
+    global _device_accumulate, _device_sources
+    fields_by_base = {f.base: f for f in reversed(avail_hist_fields) if not f.snapshot}
+    _device_sources = {
+        base: getattr(f.gather, "device_inputs", lambda f=f: (f.gather(),))
+        for base, f in fields_by_base.items()
+    }
     groups = {}
     for rank, (_count, name, _axes) in _RANKS.items():
         array = globals()[name]
@@ -362,7 +377,12 @@ def start_device_history():
     averaged = tuple(bool(value) for value in hist_avg)
 
     @jax.jit
-    def accumulate(buffers, sources):
+    def accumulate(buffers, inputs):
+        sources = {}
+        for base, field in fields_by_base.items():
+            compute = getattr(field.gather, "device_compute", None)
+            value = inputs[base][0] if compute is None else compute(*inputs[base])
+            sources[base] = jnp.asarray(value, dtype=dbl_kind)
         result = {}
         for name, fields in groups.items():
             array = buffers[name]
@@ -383,10 +403,7 @@ def start_device_history():
 
 def accumulate_device_fields():
     """Gather only enabled fields and update all ranks without a host transfer."""
-    sources = {}
-    for field in avail_hist_fields:
-        if not field.snapshot and field.base not in sources:
-            sources[field.base] = jnp.asarray(field.gather(), dtype=dbl_kind)
+    sources = {base: inputs() for base, inputs in _device_sources.items()}
     buffers = {name: globals()[name] for _, name, _ in _RANKS.values()
                if globals()[name] is not None}
     for name, array in _device_accumulate(buffers, sources).items():

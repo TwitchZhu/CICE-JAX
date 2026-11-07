@@ -414,7 +414,7 @@ def ridge_ice(dt, ndtd, hin_max, fields, layout, flags, options,
 
     # A fixed-count loop supports reverse-mode differentiation; a dynamic
     # while loop would not. Once the area closes, remaining iterations skip.
-    def iteration(_, carry):
+    def iteration(_, carry, check_batch=True):
         current, accumulated, closing, opening, done, failed = carry
 
         def advance(state):
@@ -443,7 +443,7 @@ def ridge_ice(dt, ndtd, hin_max, fields, layout, flags, options,
             return jax.lax.cond(state[-2], lambda value: value, advance, state)
 
         axis_name = options.get("ridge_axis_name")
-        if axis_name is not None:
+        if axis_name is not None and check_batch:
             # A batch-wide predicate keeps this branch scalar under vmap.
             # The per-column predicate still masks already converged columns.
             any_unfinished = jax.lax.pmax((~done).astype(jnp.int32), axis_name) > 0
@@ -453,10 +453,21 @@ def ridge_ice(dt, ndtd, hin_max, fields, layout, flags, options,
 
     fields = dict(fields)
     fields["mraftn"] = jnp.zeros_like(fields["aicen"])
-    fields, totals, _, _, done, failed = jax.lax.fori_loop(
-        0, 20, iteration,
-        (fields, totals, closing_net, opning,
-         jnp.asarray(False), jnp.asarray(False)))
+    carry = (fields, totals, closing_net, opning,
+             jnp.asarray(False), jnp.asarray(False))
+    axis_name = options.get("ridge_axis_name")
+    if axis_name is None:
+        carry = jax.lax.fori_loop(0, 20, iteration, carry)
+    else:
+        # Every column starts unfinished. Skip the entire tail if the first
+        # iteration closes the batch, avoiding 19 redundant scalar checks.
+        carry = iteration(0, carry, check_batch=False)
+        any_unfinished = jax.lax.pmax((~carry[-2]).astype(jnp.int32), axis_name) > 0
+        carry = jax.lax.cond(
+            any_unfinished,
+            lambda values: jax.lax.fori_loop(1, 20, iteration, values),
+            lambda values: values, carry)
+    fields, totals, _, _, done, failed = carry
     failed = failed | ~done
     dti = 1.0 / dt
     fields.update({

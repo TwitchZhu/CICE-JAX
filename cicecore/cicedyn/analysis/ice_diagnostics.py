@@ -534,8 +534,8 @@ def print_state(state, label, i, j, istep1):
     # endif                     ! print_points
 
 
-def make_runtime_diags(static):
-    """Compile once per run; capture only fixed switches, layout and point indices."""
+def make_runtime_diags(static, pytree, dt):
+    """Compile diagnostics and pack same-dtype results for batched host transfer."""
     config = {name: dict(static[name]) for name in (
         "ice_domain_size", "ice_domain", "icepack_tracers",
         "icepack_parameters", "ice_dyn_shared",
@@ -546,7 +546,32 @@ def make_runtime_diags(static):
     config["print_global"] = bool(print_global)
     config["print_points"] = bool(print_points)
     config["aice_extmin"] = float(aice_extmin)
-    return jax.jit(lambda pytree, dt: _runtime_diags_values(pytree, dt, config))
+    shapes = jax.eval_shape(lambda state, timestep: _runtime_diags_values(state, timestep, config),
+                            pytree, dt)
+    specs, structure = jax.tree_util.tree_flatten(shapes)
+    groups = {}
+    for index, spec in enumerate(specs):
+        groups.setdefault(spec.dtype, []).append(index)
+    groups = tuple(tuple(indices) for indices in groups.values())
+
+    @jax.jit
+    def values(pytree, dt):
+        leaves = jax.tree_util.tree_leaves(_runtime_diags_values(pytree, dt, config))
+        return tuple(jnp.concatenate([jnp.asarray(leaves[i]).reshape(-1) for i in indices])
+                     for indices in groups)
+
+    def unpack(buffers):
+        # NumPy views preserve each leaf's dtype/shape without further JAX calls.
+        leaves = [None] * len(specs)
+        for buffer, indices in zip(buffers, groups):
+            offset = 0
+            for index in indices:
+                size = specs[index].size
+                leaves[index] = buffer[offset:offset + size].reshape(specs[index].shape)
+                offset += size
+        return jax.tree_util.tree_unflatten(structure, leaves)
+
+    return values, unpack
 
 
 def _runtime_diags_values(pytree, dt, config):

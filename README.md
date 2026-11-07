@@ -38,17 +38,30 @@ For these category area and volume fields, JAX differences are of the same order
 
 All five fields have matching missing-value masks and no unmasked NaN or Inf values in the report. The results are not bit-for-bit identical. GNU–Intel differences provide an empirical reference for these builds, not an acceptance threshold or proof that the remaining differences are caused only by roundoff.
 
+## Create and run a JAX case on a server
+
+The case creator bundles the `gx3_5day` preset and generates an independent `ice_in`, `run.py`, and comparison script. See [the server command sequence](docs/SERVER_RUN.md) for environment setup, input data, direct GPU execution, and optional Fortran comparison.
+
+From `cice-dirs/cases/`, with `CICE-JAX/` and `CICE/` beside `cice-dirs/`:
+
+```bash
+python ../../CICE-JAX/cice.setup --case gx3_5day_jax --preset gx3_5day --inputdata ../../CICE/input
+python gx3_5day_jax/run.py
+```
+
+Activate the CUDA Python environment first. The JAX case runs one full grid on one GPU; it does not need a Fortran build or MPI launch. GPU profiling is optional via `run.py --profile`.
+
 ## Repository contents
 
 The repository keeps source code, configuration, and validation/comparison utilities:
 
 - `cicecore/`: JAX model state, drivers, dynamics, infrastructure, and diagnostics.
 - `icepack/`: JAX column-physics implementation and original Icepack license files.
-- `configuration/`: model configuration.
+- `configuration/`: model configuration, bundled case presets, and the generated-case runner template.
 - `test/`: validation and comparison utilities.
 - `environment.yml`: the development environment, including JAX with CUDA 12 support on Linux.
 
-Local experiment directories (`cases/`) and development notes are excluded from Git. Generated history fields, restart files, logs, profiling records, and large snapshots are also kept outside version control. The experiment described above is summarized here; its local case files and raw outputs are not distributed in this branch's current tree.
+Local experiment directories (`cases/`) and development notes are excluded from Git. Generated history fields, restart files, logs, profiling records, and large snapshots are also kept outside version control. The `gx3_5day` configuration snapshots and comparison utility are distributed under `configuration/cases/`; input datasets and archived experiment outputs are not included.
 
 ## License and attribution
 
