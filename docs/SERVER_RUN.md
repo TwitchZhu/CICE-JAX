@@ -103,7 +103,25 @@ python gx3_5day_jax/run.py
 
 程序会自动进入 case 目录读写文件。第一次运行需要 JIT 编译，首步明显慢于稳定时间步。终端首先显示日志路径；详细进度写入 `gx3_5day_jax/cice.runlog.<时间戳>`，完成时终端显示 `Completed gx3_5day_jax`。
 
-日志末尾搜索 `TIMING_TOTAL completed=` 可查看分开计算的 `compile_seconds`（JAX 追踪、降低和后端编译/缓存装载）、`run_seconds`（时间循环扣除编译、保存及 profiler 启停）、`output_seconds`（全部 history/restart 保存，已扣除编译）。`initialization_seconds` 等剩余分项与这三项相加等于 `wall_seconds`。`TIMING_OUTPUT` 进一步区分 history 和 restart 保存。监控不可用时明确输出 `unavailable`，不再用首步耗时代替编译；具体口径见 [gx3 五天案例说明](../cases/gx3_5day/README.md)。
+性能评估以日志中的 `TIMING_LOOP completed=True reason=ok` 为准：默认先推进 7 个真实时间步预热，然后对剩余完整循环整体计时。`wall_seconds` 是这段循环的总耗时，`measured_steps` 是计入的步数，`seconds_per_step` 是两者相除。120 步的试验默认测量后 113 步。预热属于原有模拟步数，不重复执行或重置模型状态；从 restart 启动时也按本次实际执行的步数计数。
+
+计时开始前和结束时等待模型状态、history 数组及 JAX effects 完成。起点位于第一个被测时间步的 forcing 准备之前，包含 forcing 读取和上传、物理计算、诊断、history/restart、日志以及现有阶段计时的开销；不含初始化、预热和循环结束后的 finalize。它是完整循环的墙钟时间，不是纯 GPU kernel 时间，也不依赖 `jax.monitoring` 的编译监控接口，适用于当前 CentOS 7 的 JAX 0.5.3。
+
+模型同步使用逐数组等待：本地 CentOS 7 / JAX 0.5.3 / WSL CUDA 组合在对完整状态同时调用 `jax.block_until_ready` 时曾卡在 CUDA stream 创建；逐数组等待可通过该位置。同步位置及等待完成的数组范围保持一致，不将未完成的 GPU 工作排除在计时之外。
+
+可调整预热步数（正整数）：
+
+```bash
+python gx3_5day_jax/run.py --warmup-steps 10
+```
+
+如果总步数不超过预热步数，输出 `reason=no_steps_after_warmup`，耗时为 `unavailable`；循环异常退出时输出 `completed=False reason=aborted`，不把部分运行作为完整性能结果。`TIMING_LOOP` 的完成标志仅表示时间步循环完成，整次运行仍需检查后面的成功标志。
+
+固定步数预热不能保证之后没有新分支触发 JIT；后续编译会如实计入循环耗时。必要时另做一次 `JAX_LOG_COMPILES=1` 的诊断运行观察编译日志，并调整预热长度。比较 SIF 与原生 conda 时，使用相同节点/GPU、软件版本、输入、预热长度及输出设置，关闭 profiler，重复运行比较结果。仅更换 JAX/cuDNN 版本也可能改变性能，不能将其差异全部归因于容器。
+
+新建 case 的 `run.py` 支持上述参数。已生成的 case 不会自动更新入口脚本；仍可使用默认 7 步计时（需指向更新后的源码），若要通过参数调整，可将 `configuration/scripts/run_case.py` 中的入口改动同步到已有 `run.py`，保留自己的配置。
+
+原有 `TIMING_TOTAL`、`TIMING_OUTPUT` 保留作为辅助诊断：`compile_seconds`、扣除编译的 `run_seconds` 等分项依赖 JAX 监控接口，接口不可用时仍明确输出 `unavailable`。不要把这些分项与 `TIMING_LOOP` 相加或混用；后者直接测量预热后的完整循环。
 
 默认关闭 GPU profiler，仍记录阶段计时；第 1–7 步记录细分物理计时。需要与本地优化过程一致的第 5–10 步 GPU 采样时，改为运行：
 
@@ -118,6 +136,8 @@ python gx3_5day_jax/run.py --profile
 ```bash
 python gx3_5day_jax/run.py --disable-cuda-command-buffer
 ```
+
+本机 CentOS 7 / glibc 2.17、JAX 0.5.3、WSL + RTX 3060 Ti 的五天实测需要此选项，并使用上述逐数组同步修复。保留默认 command buffer 时曾在第 3 步发生 `libcuda.so` 段错误；关闭后完整通过 120 步。这个结论针对该本机组合，近思需用其实际驱动验证。
 
 **重新运行会覆盖同名 history/restart 输出，日志以时间戳区分。** 如需同时保留两组输出，创建另一个 case；无需为继续运行逐项删除旧日志或目录。
 

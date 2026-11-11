@@ -186,6 +186,14 @@ class RunTiming:
         nu.flush()
 
 
+def block_until_ready(value):
+    """Wait leaf by leaf to avoid older JAX/WSL CUDA stream-creation hangs."""
+    for leaf in jax.tree.leaves(value):
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+    return value
+
+
 def record_stage(timing, name, started, ready=None, emit=True):
     """Record synchronized wall time, including dispatch and first compilation.
 
@@ -200,7 +208,7 @@ def record_stage(timing, name, started, ready=None, emit=True):
         return
     sync_started = time.perf_counter()
     if ready is not None:
-        jax.block_until_ready(ready)
+        block_until_ready(ready)
         jax.effects_barrier()
     finished = time.perf_counter()
     sync_seconds = finished - sync_started if ready is not None else 0.0

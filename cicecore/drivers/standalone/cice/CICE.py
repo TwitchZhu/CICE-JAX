@@ -20,20 +20,23 @@ import jax
 
 
 def icemodel(wave_seed=None, diagnose=False, profile_dir=None, profile_steps=(5, 7),
-             detailed_physics_steps=None):
+             detailed_physics_steps=None, warmup_steps=7):
+    if not isinstance(warmup_steps, int) or warmup_steps < 1:
+        raise ValueError("warmup_steps must be a positive integer")
     timing = ice_timers.RunTiming()
     completed = False
     try:
         with ice_timers.timing_phase("initialization"):
             CICE_Initialize()
             pytree, static = pack_initial_state(wave_seed=wave_seed)
-            jax.block_until_ready(pytree)
+            ice_timers.block_until_ready(pytree)
             jax.effects_barrier()
         with ice_timers.timing_phase("run"):
             pytree = CICE_Run(pytree, static, diagnose=diagnose,
                              profile_dir=profile_dir, profile_steps=profile_steps,
-                             detailed_physics_steps=detailed_physics_steps)
-            jax.block_until_ready(pytree)
+                             detailed_physics_steps=detailed_physics_steps,
+                             warmup_steps=warmup_steps)
+            ice_timers.block_until_ready(pytree)
             jax.effects_barrier()
         with ice_timers.timing_phase("finalize"):
             CICE_Finalize()

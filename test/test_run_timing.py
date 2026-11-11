@@ -103,7 +103,7 @@ class RunTimingTest(unittest.TestCase):
     def test_unsampled_physics_adds_no_barrier_or_fictitious_time(self):
         ice_timers.init_ice_timers()
         timing = {'step':8, 'seconds':{}, 'detailed_physics':False}
-        with patch.object(ice_timers.jax, 'block_until_ready') as wait:
+        with patch.object(ice_timers, 'block_until_ready') as wait:
             ice_timers.record_stage(timing, 'physics.horizontal.transport', 0., object())
         wait.assert_not_called()
         self.assertEqual(ice_timers._timers[3].accum, 0.)

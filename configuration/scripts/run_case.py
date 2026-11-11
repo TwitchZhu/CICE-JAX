@@ -11,9 +11,13 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--profile", action="store_true", help="Capture GPU steps 5-10.")
+parser.add_argument("--warmup-steps", type=int, default=7,
+                    help="Advance this many real steps before timing the remaining loop (default: 7).")
 parser.add_argument("--disable-cuda-command-buffer", action="store_true",
                     help="Compatibility fallback; disable CUDA command buffers globally.")
 args = parser.parse_args()
+if args.warmup_steps < 1:
+    parser.error("--warmup-steps must be a positive integer")
 
 CASE = Path(__file__).resolve().parent
 config_path = CASE / "case.json"
@@ -92,6 +96,7 @@ with log_path.open("w", encoding="utf-8") as log:
             print("Picard batch convergence guard:", PICARD_BATCH_STOP,
                   "schedule=4+12x8" if PICARD_BATCH_STOP else "schedule=100")
             print("Detailed physics timing steps:", DETAILED_PHYSICS_STEPS)
+            print("Loop timing warmup steps:", args.warmup_steps)
             print("Cleanup category loop unroll:", CLEANUP_CATEGORY_UNROLL)
             print("Rebin static tracer recovery:", REBIN_STATIC_TRACERS)
             print("Therm2 whole-column batch JIT:", THERM2_BATCH_JIT)
@@ -104,7 +109,8 @@ with log_path.open("w", encoding="utf-8") as log:
                 print(f"{name}={os.environ.get(name, '<unset>')}")
             print("Input namelist:\n" + Path("ice_in").read_text(encoding="utf-8"), flush=True)
             icemodel(profile_dir=profile_dir, profile_steps=PROFILE_STEPS,
-                     detailed_physics_steps=DETAILED_PHYSICS_STEPS)
+                     detailed_physics_steps=DETAILED_PHYSICS_STEPS,
+                     warmup_steps=args.warmup_steps)
             jax.effects_barrier()
             print(f"Final calendar: istep1={ice_calendar.istep1}, npt={ice_calendar.npt}", flush=True)
     except BaseException:

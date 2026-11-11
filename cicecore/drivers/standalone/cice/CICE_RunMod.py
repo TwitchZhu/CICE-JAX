@@ -47,7 +47,7 @@ from icepack.columnphysics.icepack_itd import column_sum
 def _diagnostic_snapshot(pytree, progress, step_number, stage, step_start):
     """Synchronize JAX work before recording a diagnostic stage boundary."""
     sync_start = time.perf_counter()
-    jax.block_until_ready(pytree)
+    ice_timers.block_until_ready(pytree)
     sync_seconds = time.perf_counter() - sync_start
     fields = [f"step={step_number}", f"stage={stage}",
               f"elapsed={time.perf_counter() - step_start:.2f}s",
@@ -107,8 +107,10 @@ _ATMOSPHERE_FIELDS = (
 
 
 def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5, 7),
-             detailed_physics_steps=None):
+             detailed_physics_steps=None, warmup_steps=7):
     """Advance CICE, keeping the file and calendar work on the host."""
+    if not isinstance(warmup_steps, int) or warmup_steps < 1:
+        raise ValueError("warmup_steps must be a positive integer")
     profile_start, profile_end = profile_steps
     if profile_dir is not None and not (1 <= profile_start <= profile_end):
         raise ValueError("profile_steps must be an inclusive positive step range")
@@ -122,6 +124,11 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
     status_counts = jax.jit(lambda status: jnp.stack([
         jnp.count_nonzero(status[name]) for name in status_names]))
     pending_forcing = {}
+    completed_steps = 0
+    measured_steps = 0
+    loop_started = None
+    loop_seconds = None
+    loop_completed = False
     ice_fileunits.nu_diag.write(
         "TIMING enabled: synchronized wall time includes dispatch and compilation.\n"
         "TIMING forcing is charged to the step consuming it; step 1 forcing is in initialization.\n"
@@ -129,6 +136,11 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
     ice_fileunits.nu_diag.write(
         f"TIMING detailed physics steps={detailed_physics_steps}; None means all steps.\n"
         "TIMING physics completion stays synchronized when physics substage timing is disabled.\n")
+    ice_fileunits.nu_diag.write(
+        f"TIMING_LOOP_CONFIG warmup_steps={warmup_steps} "
+        f"profiling_enabled={profile_dir is not None} diagnose={diagnose}\n"
+        "TIMING_LOOP includes forcing, physics, diagnostics, history/restart, logging "
+        "and existing timing instrumentation; later compilation is not subtracted.\n")
     #--------------------------------------------------------------------
     # initialize error code and step timer
     #--------------------------------------------------------------------
@@ -141,7 +153,7 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
         while True:
             step_number = int(ice_calendar.istep1)
             if profile_dir is not None and step_number == profile_start:
-                jax.block_until_ready(pytree)
+                ice_timers.block_until_ready(pytree)
                 jax.effects_barrier()
                 Path(profile_dir).mkdir(parents=True, exist_ok=True)
                 with ice_timers.timing_phase("profiling"):
@@ -370,15 +382,30 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                                       + timing["seconds"].get("forcing", 0.0))
             ice_timers.print_step_timing(timing)
             if profile_active and (step_number >= profile_end or ice_calendar.stop_now >= 1):
-                jax.block_until_ready(pytree)
+                ice_timers.block_until_ready(pytree)
                 jax.effects_barrier()
                 profile_active = False
                 with ice_timers.timing_phase("profiling"):
                     jax.profiler.stop_trace()
                 ice_fileunits.nu_diag.write(f"PROFILE saved directory={profile_dir}\n")
                 ice_fileunits.nu_diag.flush()
+            completed_steps += 1
+            if loop_started is not None:
+                measured_steps += 1
             if ice_calendar.stop_now >= 1:
                 break
+
+            # Forcing for the first measured step is prepared below, before
+            # the next iteration. Count executed steps, including on restart.
+            if completed_steps == warmup_steps:
+                history_arrays = [getattr(ice_history_shared, name)
+                                  for _, name, _ in ice_history_shared._RANKS.values()]
+                ice_timers.block_until_ready((pytree, history_arrays))
+                jax.effects_barrier()
+                ice_fileunits.nu_diag.write(
+                    f"TIMING_LOOP_START first_step={int(ice_calendar.istep1)}\n")
+                ice_fileunits.nu_diag.flush()
+                loop_started = time.perf_counter()
 
             ice_fileunits.nu_diag.write(
                 f"Time step {int(ice_calendar.istep1)}: entering forcing\n"
@@ -584,11 +611,30 @@ def CICE_Run(pytree, static, diagnose=False, profile_dir=None, profile_steps=(5,
                 ice_timers.ice_timer_stop(ice_timers.timer_couple)
             ice_timers.record_stage(next_timing, "forcing", forcing_started)
             pending_forcing = next_timing["seconds"]
+        if loop_started is not None:
+            history_arrays = [getattr(ice_history_shared, name)
+                              for _, name, _ in ice_history_shared._RANKS.values()]
+            ice_timers.block_until_ready((pytree, history_arrays))
+            jax.effects_barrier()
+            ice_fileunits.nu_diag.flush()
+            loop_seconds = time.perf_counter() - loop_started
+        loop_completed = True
     finally:
         ice_timers.ice_timer_stop(ice_timers.timer_step)
         if profile_active:
             with ice_timers.timing_phase("profiling"):
                 jax.profiler.stop_trace()
+        seconds = f"{loop_seconds:.6f}" if loop_seconds is not None else "unavailable"
+        average = (f"{loop_seconds / measured_steps:.6f}"
+                   if loop_seconds is not None and measured_steps else "unavailable")
+        reason = ("aborted" if not loop_completed else
+                  "no_steps_after_warmup" if not measured_steps else "ok")
+        ice_fileunits.nu_diag.write(
+            f"TIMING_LOOP completed={loop_completed} reason={reason} "
+            f"warmup_steps={min(completed_steps, warmup_steps)} "
+            f"measured_steps={measured_steps} wall_seconds={seconds} "
+            f"seconds_per_step={average} profiling_enabled={profile_dir is not None}\n")
+        ice_fileunits.nu_diag.flush()
 
     return pytree
 
